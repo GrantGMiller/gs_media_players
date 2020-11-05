@@ -4,14 +4,14 @@ from extronlib_pro import (
     File,
     Wait,
     event,
-    IsExtronHardware,
 )
 from aes_tools import Encrypt, Decrypt, GetRandomKey
-from gs_tools import HashableDict, DecodeLiteral, EncodeLiteral
 import re
 import datetime
 import json
 from collections import defaultdict
+
+from gs_tools import DecodeLiteral, HashableDict
 
 RE_LIST_FILENAME = re.compile('(.*?\..*?) .{3}, .{1,2} .{3} .{4} .{2}:.{2}:.{2} GMT (\d{1,10})\r\n')
 
@@ -84,8 +84,9 @@ class _Player:
         # override this with subclass
         return self._connectionStatus
 
-    def __del__(self):
-        self._interface.Disconnect()
+    # def __del__(self):
+    #     print('_Player.__del__')
+    #     self._interface.Disconnect()
 
     def GetCurrentPlayingFile(self):
         # returns None if no file or str filename like 'imagefile.png'
@@ -124,7 +125,8 @@ class SMD202_Player(_Player):
         else:
             self._encryptedPassword = Encrypt(PlainPassword, GetKey())
 
-        self._interface = EthernetClientInterface(IPAddress, IPPort)  # smdModule.EthernetClass(IPAddress, IPPort)
+        self._interface = EthernetClientInterface(IPAddress, IPPort,
+                                                  debug=True)  # smdModule.EthernetClass(IPAddress, IPPort)
         self._Status = defaultdict(lambda: defaultdict(lambda: None))
         self._InitInterfaceEvents()
 
@@ -148,12 +150,12 @@ class SMD202_Player(_Player):
                     print('Error no player pw')
                 else:
                     print('538 pw=', pw)
-                    self._interface.Send(pw + '\r')
+                    self._interface.SendAndWait(pw + '\r', 0.1)
 
             elif 'Login Administrator' in data or 'Login User' in data:
                 print('PLAYER AUTHENTICATED')
                 self._authenticated = True
-                self._interface.Send('w3cv\r')
+                self._interface.SendAndWait('w3cv\r', 0.1)
 
             elif 'Fld?' in data:
                 raise IOError('Not enough space available on player.')
@@ -161,9 +163,10 @@ class SMD202_Player(_Player):
         @event(self._interface, ['Connected', 'Disconnected'])
         def ConnectionEvent(interface, state):
             print('151 SMD ConnectionEvent', state)
+            self._WriteStatus('ConnectionStatus', state)
+
             if state == 'Connected':
-                self._WriteStatus('ConnectionStatus', state)
-                self._interface.Send('w3cv\r')
+                self._interface.SendAndWait('w3cv\r', 0.1)
                 self._authenticated = True  # assume no password
             elif state == 'Disconnected':
                 self._authenticated = False
@@ -189,6 +192,7 @@ class SMD202_Player(_Player):
         :return:
         '''
         print('Update', newParamsDict, meta)
+        print('195 Update Disconnect()')
         self._interface.Disconnect()
 
         self.connectionParameters.update(newParamsDict)
@@ -255,6 +259,9 @@ class SMD202_Player(_Player):
         self._Status[c][q] = v
         print('228 self_Status=', self._Status)
 
+        if c == 'ConnectionStatus' and v == 'Disconnected':
+            self._interface.CancelSend()
+
     @property
     def IPAddress(self):
         return self._interface.IPAddress
@@ -270,15 +277,16 @@ class SMD202_Player(_Player):
         while self._working:
             print('SendAndWait waiting to send')
             time.sleep(1)
-            if time.time() - startTime > 10:
+            if time.time() - startTime > 3:
                 print('SendAndWait timed out')
-                return
+                return None
 
         self._Connect()
         connectResult = self._interface.Connect()
+        print('280 connectResult=', connectResult)
         if 'Connected' not in connectResult:
             self._WriteStatus('ConnectionStatus', 'Disconnected')
-            raise Exception(connectResult)
+            return None
         else:
             self._WriteStatus('ConnectionStatus', 'Connected')
 
@@ -288,12 +296,16 @@ class SMD202_Player(_Player):
             time.sleep(1)
             count += 1
             if count > 10:
-                raise Exception('Error connecting')
+                print('could not authenticate')
+                return None
+        print('authenticated')
 
         try:
             res = self._interface.SendAndWait(*args, **kwargs)
         except Exception as e:
-            return str(e)
+            print('Exception 298:', e)
+            self._WriteStatus('ConnectionStatus', 'Disconnected')
+            return None
 
         print('262 res=', res)
         return res
@@ -305,14 +317,14 @@ class SMD202_Player(_Player):
         if self._authenticated is True:
             print('739 smd already connected')
             self._wait_InterfaceDisconnect.Restart()
-            return
+            return 'Connected'
 
         res = self._interface.Connect(3)
         print('723 res=', res)
-        self._WriteStatus('ConnectionStatus', res)
+        self._WriteStatus('ConnectionStatus', 'Connected' if 'Connected' in res else 'Disconnected')
         if res != 'Connected':
             # raise RuntimeError('Could not connect to SMD 202 at IP={}: {}'.format(self.IPAddress, res))
-            return
+            return 'Disconnected'
 
         time.sleep(1)  # allow time for authentication
         count = 0
@@ -321,14 +333,16 @@ class SMD202_Player(_Player):
             time.sleep(1)
             count += 1
             if count > 10:
-                raise Exception('Error connecting')
+                return 'Disconnected'
 
         self._wait_InterfaceDisconnect.Restart()
 
     def _Disconnect(self):
+        print('SMD202_Player._Disconnect(), self._forceStayConnected=', self._forceStayConnected)
         if self._forceStayConnected is True:
             self._wait_InterfaceDisconnect.Restart()
         else:
+            print('345 Disconnect()')
             self._interface.Disconnect()
             self._authenticated = False
 
@@ -407,9 +421,9 @@ class SMD202_Player(_Player):
             if filepath is not None:
                 msg = 'wU{}*{}PLYR\r'.format(1, filepath)
                 print('651 msg=', msg)
-                self._interface.Send(msg)
+                self._interface.SendAndWait(msg, 0.1)
                 time.sleep(5)  # give the SMD time to load the content
-                self._interface.Send('wS1*1PLYR\x0D')  # play the content
+                self._interface.SendAndWait('wS1*1PLYR\x0D', 0.1)  # play the content
             else:
                 raise KeyError(
                     '983 filepath is None. The desired file "{}" was not found on the player'.format(filepath))
@@ -417,7 +431,7 @@ class SMD202_Player(_Player):
     def Stop(self):
         print('Stop(', self)
         self._Connect()
-        self._interface.Send('wO1PLYR\x0D')  # stop
+        self._interface.SendAndWait('wO1PLYR\x0D', 0.1)  # stop
 
     def GetSizeOfFile(self, filepath):
         print('402 GetSizeOfFile(', filepath)
@@ -452,7 +466,8 @@ class SMD202_Player(_Player):
         print('423 DeleteFile res=', res)
         return res
 
-    def LoadFileToMemory(self, localURI):
+    def LoadFileToMemory(self, localURI, progressCallback=None):
+        # sends the file from the localURI to the player's internal memory
         print('LoadFileToMemory(', localURI)
 
         self._working = True
@@ -467,7 +482,7 @@ class SMD202_Player(_Player):
         self._Connect()
 
         try:
-            self._interface.Send('w3cv\r')
+            self._interface.SendAndWait('w3cv\r', 0.1)
 
             time.sleep(1)
             print('Sending to SMD')
@@ -491,7 +506,8 @@ class SMD202_Player(_Player):
                 print('394 Sending the file.read()')
 
                 self._interface.Send(file.read(),
-                                     progressCallback=lambda percent: print('Sending File {}%'.format(percent)))
+                                     progressCallback=progressCallback)
+                self._working = False  # allow SendAndWaits to work again
 
                 time.sleep(2)
                 res = self._interface.SendAndWait('15i', 1, deliTag='\r\n')
@@ -655,8 +671,9 @@ class SMD202_Player(_Player):
         else:
             return self._partNumber
 
-    def __del__(self):
-        self._interface.Disconnect()
+    # def __del__(self):
+    #     print('SMD202_Player.__del__()')
+    #     self._interface.Disconnect()
 
     def __str__(self):
         return '<SMD202_Player: IPAddress={}, IPPort={}>'.format(self.IPAddress, self.IPPort)
@@ -750,6 +767,8 @@ class _Playlist:
 
 
 if __name__ == '__main__':
+    from extronlib_pro import Timer
+
     player = SMD202_Player(
         connectionParameters={
             'IPAddress': '192.168.68.143',
@@ -758,8 +777,14 @@ if __name__ == '__main__':
         }
     )
     print('player.MACAddress=', player.MACAddress)
-    FILE = 'Extron_favicon_200px.png'
-    size = player.GetSizeOfFile(FILE)
-    print('size=', size)
-    res = player.VerifySize(FILE, size)
-    print('res=', res)
+    # FILE = 'Extron_favicon_200px.png'
+    # size = player.GetSizeOfFile(FILE)
+    # print('size=', size)
+    # res = player.VerifySize(FILE, size)
+    # print('res=', res)
+
+    t = Timer(1, lambda t, c: player.SendAndWait('q', 1))
+    time.sleep(3)
+
+    PATH_LOCAL = r'starwars-tvspot_h1080p.mov'
+    player.LoadFileToMemory(PATH_LOCAL)
