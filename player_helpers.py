@@ -150,7 +150,7 @@ class SMD202_Player(_Player):
                     print('Error no player pw')
                 else:
                     print('538 pw=', pw)
-                    self._interface.SendAndWait(pw + '\r', 0.1)
+                    self._interface.Send(pw + '\r')
 
             elif 'Login Administrator' in data or 'Login User' in data:
                 print('PLAYER AUTHENTICATED')
